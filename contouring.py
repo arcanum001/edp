@@ -1,7 +1,5 @@
 import cv2
 import numpy as np
-from tifffile import imshow
-
 
 def find_center_word(binary_img,min_area=100):
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
@@ -86,5 +84,3 @@ def find_center_word_paddle(binary_img,original_img,tesseract,min_area=100):
 
 
     return best_contour, cropped_word
-
-

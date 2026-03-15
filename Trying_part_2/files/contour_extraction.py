@@ -55,92 +55,16 @@ def find_center_word(binary_img, original_img=None, min_area=100, debug=False):
             cv2.waitKey(0)
             print(f"[DEBUG] Step 1 — original shape: {original_img.shape}")
 
-    # ── Step 2 — Dilation ─────────────────────────────────────────────────────
-    kernel    = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
-    word_mask = cv2.dilate(binary_img, kernel, iterations=1)
-
-    if debug:
-        show("Step 2 - Dilated Word Mask", word_mask)
-        cv2.waitKey(0)
-        print(f"[DEBUG] Step 2 — dilation done with kernel (15,3)")
-
-    # ── Step 3 — Find contours ────────────────────────────────────────────────
-    contours, _ = cv2.findContours(
-        word_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    if debug:
-        vis3 = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
-        cv2.drawContours(vis3, contours, -1, (0, 255, 255), 1)
-        cv2.putText(vis3, f"Total contours: {len(contours)}",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        show("Step 3 - All Contours", vis3)
-        cv2.waitKey(0)
-        print(f"[DEBUG] Step 3 — found {len(contours)} contours")
-
-    if not contours:
-        print("[DEBUG] No contours found — returning None")
-        return None, None, None
-
-    # ── Step 4 — Area filter ──────────────────────────────────────────────────
-    bin_h, bin_w = binary_img.shape
-    img_center   = np.array([bin_w // 2, bin_h // 2])
-
-    if debug:
-        vis4           = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
-        kept, rejected = [], []
-        for cnt in contours:
-            (kept if cv2.contourArea(cnt) >= min_area else rejected).append(cnt)
-        cv2.drawContours(vis4, rejected, -1, (0, 0, 255), 1)
-        cv2.drawContours(vis4, kept,     -1, (0, 255, 0), 1)
-        cv2.drawMarker(vis4, tuple(img_center), (255, 0, 0),
-                       cv2.MARKER_CROSS, 20, 2)
-        cv2.putText(vis4, f"Kept: {len(kept)}  Rejected: {len(rejected)}",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        show("Step 4 - Area Filter  (green=kept  red=rejected  blue=center)", vis4)
-        cv2.waitKey(0)
-        print(f"[DEBUG] Step 4 — kept {len(kept)}  rejected {len(rejected)}")
-
-    # ── Step 5 — Find closest contour to image center ─────────────────────────
-    best_contour  = None
-    min_distance  = float("inf")
-    all_distances = []
-
-    for cnt in contours:
-        if cv2.contourArea(cnt) < min_area:
-            continue
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        box_center   = np.array([x + bw // 2, y + bh // 2])
-        dist         = np.linalg.norm(box_center - img_center)
-        all_distances.append((dist, (x, y, bw, bh), box_center))
-        if dist < min_distance:
-            min_distance = dist
-            best_contour = (x, y, bw, bh)
-
-    if debug:
-        vis5 = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
-        for dist, (x, y, bw, bh), box_center in all_distances:
-            cv2.rectangle(vis5, (x, y), (x + bw, y + bh), (0, 200, 200), 1)
-            cv2.circle(vis5, tuple(box_center.astype(int)), 4, (200, 200, 0), -1)
-            cv2.line(vis5, tuple(box_center.astype(int)),
-                     tuple(img_center), (100, 100, 100), 1)
-            cv2.putText(vis5, f"{dist:.0f}px", (x, max(y - 5, 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 0), 1)
-        if best_contour:
-            bx, by, bw, bh = best_contour
-            cv2.rectangle(vis5, (bx, by), (bx + bw, by + bh), (0, 255, 0), 3)
-            cv2.putText(vis5, f"BEST ({min_distance:.0f}px)",
-                        (bx, max(by - 10, 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.drawMarker(vis5, tuple(img_center), (0, 0, 255),
-                       cv2.MARKER_CROSS, 20, 2)
-        show("Step 5 - Closest to Center  (green=best)", vis5)
-        cv2.waitKey(0)
-        print(f"[DEBUG] Step 5 — best: {best_contour}  dist: {min_distance:.1f}px")
-
-    if best_contour is None:
-        print("[DEBUG] No valid contour found")
-        return None, None, None
+    # ── FIXED TARGET ROI (Replaces fragile contour logic) ─────────────────────
+    bin_h, bin_w = binary_img.shape[:2]
+    
+    # Define a central box: 60% of image width, 20% of image height
+    bw = int(bin_w * 0.60)
+    bh = int(bin_h * 0.20)
+    x  = int((bin_w - bw) / 2)
+    y  = int((bin_h - bh) / 2)
+    
+    best_contour = (x, y, bw, bh)
 
     # ── Step 6 — Crop binary ──────────────────────────────────────────────────
     x, y, bw, bh = best_contour

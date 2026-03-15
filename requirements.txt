@@ -1,6 +1,7 @@
 # Core numerical & image processing
 numpy>=1.23
 opencv-python>=4.8
+scikit-image>=0.19
 
 # OCR
 paddleocr>=2.8.1

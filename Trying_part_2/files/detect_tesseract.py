@@ -3,6 +3,11 @@ import numpy as np
 import pytesseract
 import os
 
+# Tell pytesseract where to find the Tesseract-OCR executable.
+# This is the default installation path on Windows.
+# Please verify this path is correct on your system.
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
 def enhance_for_ocr(crop_original, debug=False):
 
     # Step 1 — Grayscale
@@ -244,10 +249,7 @@ if __name__ == "__main__":
         # ── Run OCR on all 3 ──────────────────────────────────────
         text_binary, conf_binary = ocr_center_word(img_binary, min_conf=0, debug=False)
         text_gray, conf_gray = ocr_center_word(img_gray, min_conf=0, debug=False)
-        text_colour, conf_colour = ocr_center_word(img_colour, min_conf=0, debug=False
-
-
-                                                   )
+        text_colour, conf_colour = ocr_center_word(img_colour, min_conf=0, debug=False)
 
         # ── Compare results ───────────────────────────────────────
         results = {

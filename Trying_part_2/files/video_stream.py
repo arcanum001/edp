@@ -1,11 +1,51 @@
 
-
 import cv2
 import numpy as np
-from binarization import *
-from contour_extraction import *
-from detect_tesseract import *
-from result_panel import *
+import threading
+import pytesseract
+
+class ThreadedCamera:
+    """
+    Reads frames in a background thread so the buffer is constantly flushed.
+    This guarantees we always get the most recent frame, eliminating lag.
+    """
+    def __init__(self, source):
+        self.cap = cv2.VideoCapture(source)
+        self.running = True
+        self.ret = False
+        self.frame = None
+        if self.cap.isOpened():
+            self.ret, self.frame = self.cap.read()
+            self.thread = threading.Thread(target=self.update, args=())
+            self.thread.daemon = True
+            self.thread.start()
+        else:
+            self.running = False
+
+    def update(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            self.ret = ret
+            if ret:
+                self.frame = frame
+
+    def read(self):
+        if self.frame is not None:
+            return self.ret, self.frame.copy()
+        return self.ret, None
+
+    def release(self):
+        self.running = False
+        if hasattr(self, 'thread') and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        self.cap.release()
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+# Tell pytesseract where to find the Tesseract-OCR executable
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
 def run_video(source=0, process_every=5):
     """
     source       : 0 = webcam, or path to video file
@@ -13,7 +53,8 @@ def run_video(source=0, process_every=5):
                    5 = process 1 in every 5 frames
     """
 
-    cap = cv2.VideoCapture(source)
+    cap = ThreadedCamera(source)
+
     if not cap.isOpened():
         print(f"[ERROR] Cannot open source: {source}")
         return
@@ -23,14 +64,9 @@ def run_video(source=0, process_every=5):
 
     frame_count  = 0
 
-    # Cached results — shown every frame but only updated every N frames
-    cached_panel      = None
-    cached_bbox       = None
-    cached_crop_bin   = None
-    cached_crop_orig  = None
-    cached_text_bin   = None;  cached_conf_bin  = 0
-    cached_text_gray  = None;  cached_conf_gray = 0
-    cached_text_col   = None;  cached_conf_col  = 0
+    cached_results = []
+    
+    last_read_word = ""
 
     while True:
         ret, frame = cap.read()
@@ -39,86 +75,157 @@ def run_video(source=0, process_every=5):
             break
 
         frame_count += 1
-
-        # ── Draw crosshair on live feed ───────────────────────────────────────
-        h_f, w_f = frame.shape[:2]
-        cv2.line(frame, (w_f//2, 0),   (w_f//2, h_f),   (0, 0, 255), 1)
-        cv2.line(frame, (0, h_f//2),   (w_f, h_f//2),   (0, 0, 255), 1)
+        
 
         # ── Process every N frames ────────────────────────────────────────────
         if frame_count % process_every == 0:
-            print(f"[FRAME {frame_count}] Processing...")
+            print(f"[FRAME {frame_count}] Scanning text...")
+            # Provide entire frame to deep-learning OCR model
+            
+            # Apply a mild sharpening filter to combat motion blur from gliding
+            kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+            sharp_frame = cv2.filter2D(frame, -1, kernel)
+            
+            # ── SPEED OPTIMIZATION: Crop a Region of Interest (ROI) ───────────
+            # Only run heavy AI on the center of the image, ignoring the edges.
+            h_f, w_f = sharp_frame.shape[:2]
+            roi_w, roi_h = int(w_f * 0.60), int(h_f * 0.40)
+            roi_x, roi_y = (w_f - roi_w) // 2, (h_f - roi_h) // 2
+            
+            roi_frame = sharp_frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
+            
+            # ── LIGHTWEIGHT MODEL: Tesseract ──────────────────────────────
+            gray_roi = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+            data = pytesseract.image_to_data(gray_roi, output_type=pytesseract.Output.DICT)
+            
+            cached_results = []
+            for i in range(len(data['text'])):
+                conf = int(data['conf'][i])
+                text = data['text'][i].strip()
+                if conf > 80 and text:
+                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                    # Convert to polygon format for existing drawing logic
+                    adjusted_box = [
+                        [x + roi_x, y + roi_y],
+                        [x + w + roi_x, y + roi_y],
+                        [x + w + roi_x, y + h + roi_y],
+                        [x + roi_x, y + h + roi_y]
+                    ]
+                    # Tesseract gives conf out of 100, we scale to 1.0 to match earlier code
+                    cached_results.append((adjusted_box, text, conf / 100.0))
 
-            # Step 1 — Binarize
-            binary = binarize(frame, debug=False)
+        # ── Find the word closest to the center (The "Finger") ────────────────
+        h_f, w_f = frame.shape[:2]
+        center_x, center_y = w_f // 2, h_f // 2
+        
+        # Draw the active AI scanning zone to help the user aim
+        roi_w, roi_h = int(w_f * 0.60), int(h_f * 0.40)
+        roi_x, roi_y = (w_f - roi_w) // 2, (h_f - roi_h) // 2
+        cv2.rectangle(frame, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (80, 80, 80), 2)
+        cv2.putText(frame, "AI SCAN ZONE", (roi_x + 5, roi_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
 
-            # Step 2 — Find center word
-            bbox, crop_bin, crop_orig = find_center_word(
-                binary_img   = binary,
-                original_img = frame,
-                min_area     = 100
-            )
+        # Draw a targeting crosshair and a solid red dot in the center ("virtual finger")
+        cv2.drawMarker(frame, (center_x, center_y), (0, 0, 255), cv2.MARKER_CROSS, 40, 2)
+        cv2.circle(frame, (center_x, center_y), 6, (0, 0, 255), -1)
 
-            if bbox is not None and crop_orig is not None:
+        closest_dist = float('inf')
+        target_word = None
+        target_box = None
 
-                # Step 3 — Prepare 3 versions
-                img_binary  = crop_bin
-               # img_gray    = enhance_for_ocr(crop_orig)
-                img_gray=cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                img_colour  = crop_orig
+        for box, text, conf in cached_results:
+            # Calculate the center of this word's bounding box
+            poly_cx = sum(p[0] for p in box) / 4
+            poly_cy = sum(p[1] for p in box) / 4
+            dist = np.hypot(center_x - poly_cx, center_y - poly_cy)
+            
+            if dist < closest_dist:
+                closest_dist = dist
+                target_word = text
+                target_box = box
 
-                # Step 4 — OCR all 3
-                text_bin,  conf_bin  = ocr_center_word(img_binary,-1)
-                text_gray, conf_gray = ocr_center_word(img_gray,-1)
-                text_col,  conf_col  = ocr_center_word(img_colour,-1)
+        # ── Draw all boxes, highlighting the targeted one ─────────────────────
+        for box, text, conf in cached_results:
+            is_target = (box == target_box)
+            color = (0, 0, 255) if is_target else (0, 255, 0) # Red if target, Green otherwise
+            thickness = 4 if is_target else 2
+            
+            pts = np.array(box, np.int32).reshape((-1, 1, 2))
+            cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
+            
+            # Draw a dot at the center of the bounding box to show its anchor point
+            b_cx = int(sum(p[0] for p in box) / 4)
+            b_cy = int(sum(p[1] for p in box) / 4)
+            cv2.circle(frame, (b_cx, b_cy), 5, color, -1)
+            
+            # Draw a tether line from the crosshair to the targeted word
+            if is_target:
+                cv2.line(frame, (center_x, center_y), (b_cx, b_cy), (0, 0, 255), 2)
+            
+            x, y = int(box[0][0]), int(box[0][1])
+            display_text = f"{text} ({int(conf*100)}%)"
+            cv2.putText(frame, display_text, (x, max(y - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), thickness + 2)
+            cv2.putText(frame, display_text, (x, max(y - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, thickness)
 
-                print(f"  Binary    : {str(text_bin):>15}  {conf_bin}%")
-                print(f"  Gray      : {str(text_gray):>15}  {conf_gray}%")
-                print(f"  Colour    : {str(text_col):>15}  {conf_col}%")
-
-                # Cache results
-                cached_bbox      = bbox
-                cached_crop_bin  = crop_bin
-                cached_crop_orig = crop_orig
-                cached_text_bin  = text_bin;  cached_conf_bin  = conf_bin
-                cached_text_gray = text_gray; cached_conf_gray = conf_gray
-                cached_text_col  = text_col;  cached_conf_col  = conf_col
-
-                # Draw bbox on live frame
-                x, y, bw, bh = bbox
-                # Scale bbox back to original frame size
-                bin_h, bin_w = binary.shape[:2]
-                sx = w_f / bin_w
-                sy = h_f / bin_h
-                fx  = int(x  * sx);  fy  = int(y  * sy)
-                fbw = int(bw * sx);  fbh = int(bh * sy)
-                cv2.rectangle(frame, (fx, fy), (fx+fbw, fy+fbh),
-                              (0, 255, 0), 2)
-
-            # Build result panel from cached data
-            if cached_crop_orig is not None:
-                cached_panel = build_result_panel(
-                    frame,
-                    cached_bbox,
-                    cached_crop_bin,
-                    cached_crop_orig,
-                    cached_text_bin,  cached_conf_bin,
-                    cached_text_gray, cached_conf_gray,
-                    cached_text_col,  cached_conf_col,
-                )
-
-        else:
-            # Non-processing frame — still draw cached bbox on live feed
-            if cached_bbox is not None:
-                binary    = binarize(frame, debug=False)
-                bin_h, bin_w = binary.shape[:2]
-                sx = w_f / bin_w
-                sy = h_f / bin_h
-                x, y, bw, bh = cached_bbox
-                fx  = int(x  * sx);  fy  = int(y  * sy)
-                fbw = int(bw * sx);  fbh = int(bh * sy)
-                cv2.rectangle(frame, (fx, fy), (fx+fbw, fy+fbh),
-                              (0, 255, 0), 2)
+        # ── Find the specific single word under the crosshair ─────────────────
+        pointed_word = ""
+        line_status = ""
+        if target_word and target_box:
+            box_left = min(p[0] for p in target_box)
+            box_right = max(p[0] for p in target_box)
+            box_width = box_right - box_left
+            
+            if box_width > 0:
+                # Estimate where the crosshair falls along the phrase (0.0 to 1.0)
+                ratio = (center_x - box_left) / box_width
+                ratio = max(0.0, min(1.0, ratio))
+                
+                # Map percentage to string index
+                char_index = int(ratio * len(target_word))
+                
+                # Split phrase into words and find the one at char_index
+                words = target_word.split()
+                current_idx = 0
+                for w in words:
+                    word_start = current_idx
+                    word_end = current_idx + len(w)
+                    if word_start <= char_index <= word_end + 1:
+                        pointed_word = w
+                        break
+                    current_idx += len(w) + 1
+                    
+            # Clean punctuation for haptic engine (e.g. "paper," -> "paper")
+            pointed_word = ''.join(e for e in pointed_word if e.isalnum()).lower()
+            
+            # ── Detect if this is the Start or End of a line ──────────────────
+            b_cy = sum(p[1] for p in target_box) / 4
+            b_h = max(p[1] for p in target_box) - min(p[1] for p in target_box)
+            
+            # Group words that share the same horizontal band (Y-axis)
+            line_boxes = [b for b, t, c in cached_results if abs((sum(p[1] for p in b)/4) - b_cy) < (b_h / 2)]
+            
+            if line_boxes:
+                # Find the furthest left and furthest right boxes in this line
+                rightmost_box = max(line_boxes, key=lambda b: max(p[0] for p in b))
+                leftmost_box = min(line_boxes, key=lambda b: min(p[0] for p in b))
+                
+                if target_box == rightmost_box:
+                    line_status = " [END OF LINE]"
+                elif target_box == leftmost_box:
+                    line_status = " [START OF LINE]"
+            
+        # ── Debounce and Output the Single Word ───────────────────────────────
+        if pointed_word and pointed_word != last_read_word:
+            if closest_dist < 200: 
+                print(f"\n[HAPTIC OUTPUT TRIGGER] --> {pointed_word}{line_status}")
+                last_read_word = pointed_word
+                
+        # Draw the currently pointed word prominently at the top of the screen
+        if pointed_word:
+            display_text = f"TARGET: {pointed_word.upper()}{line_status}"
+            cv2.putText(frame, display_text, (10, 70), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 5)
+            cv2.putText(frame, display_text, (10, 70), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
 
         # ── Frame counter on live feed ────────────────────────────────────────
         cv2.putText(frame, f"Frame: {frame_count}  "
@@ -126,19 +233,13 @@ def run_video(source=0, process_every=5):
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (200, 200, 200), 1)
 
-        # ── Display live feed + panel side by side ────────────────────────────
-        if cached_panel is not None:
-            # Match heights
-            fh, fw = frame.shape[:2]
-            ph      = cached_panel.shape[0]
-            if ph != fh:
-                cached_panel = cv2.resize(cached_panel, (cached_panel.shape[1], fh))
-            combined = np.hstack([frame, cached_panel])
-        else:
-            combined = frame
-
-        show("Video Feed + OCR Results  [q = quit]", combined,
-             max_width=1400, max_height=800)
+        # ── Display live feed ─────────────────────────────────────────────────
+        h, w = frame.shape[:2]
+        scale = min(1200 / w, 900 / h, 1.0)
+        if scale < 1.0:
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            
+        cv2.imshow("Deep Learning Scanner [q = quit]", frame)
 
         # ── Key controls ──────────────────────────────────────────────────────
         key = cv2.waitKey(1) & 0xFF
@@ -157,6 +258,9 @@ def run_video(source=0, process_every=5):
 
 if __name__ == "__main__":
     run_video(
-        source        = 0,    # ← 0 = webcam, or "video.mp4"
+        # To use your phone's camera, install an app like "IP Webcam" on Android
+        # or "EpocCam" on iOS. Then, find the video stream URL in the app
+        # and paste it here. It will look something like "http://192.168.1.5:8080/video"
+        source        = "http://172.23.155.223:8080/video",
         process_every = 5     # ← process 1 in every 5 frames
     )
